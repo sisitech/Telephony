@@ -54,7 +54,16 @@ class SmsMethodCallHandler(
     MethodChannel.MethodCallHandler,
     BroadcastReceiver() {
 
-  private lateinit var result: MethodChannel.Result
+  /**
+   * Holds the reply handle for the in-flight method call.
+   *
+   * A [MethodChannel.Result] can only be replied to once. Every reply must therefore go
+   * through [replySuccess] / [replyError] / [replyNotImplemented], which consume the handle
+   * by setting it back to null. Replying directly would crash the app with
+   * `IllegalStateException: Reply already submitted` whenever the platform delivers a
+   * duplicate permission callback.
+   */
+  private var pendingResult: MethodChannel.Result? = null
   private lateinit var action: SmsAction
   private lateinit var foregroundChannel: MethodChannel
   private lateinit var activity: Activity
@@ -75,13 +84,28 @@ class SmsMethodCallHandler(
 
   private var requestCode: Int = -1
 
+  private fun replySuccess(value: Any?) {
+    pendingResult?.success(value)
+    pendingResult = null
+  }
+
+  private fun replyError(errorCode: String, errorMessage: String?, details: Any?) {
+    pendingResult?.error(errorCode, errorMessage, details)
+    pendingResult = null
+  }
+
+  private fun replyNotImplemented() {
+    pendingResult?.notImplemented()
+    pendingResult = null
+  }
+
   override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
-    this.result = result
+    this.pendingResult = result
 
     action = SmsAction.fromMethod(call.method)
 
     if (action == SmsAction.NO_SUCH_METHOD) {
-      result.notImplemented()
+      replyNotImplemented()
       return
     }
 
@@ -100,7 +124,7 @@ class SmsMethodCallHandler(
           val messageBody = call.argument<String>(MESSAGE_BODY)
           val address = call.argument<String>(ADDRESS)
           if (messageBody.isNullOrBlank() || address.isNullOrBlank()) {
-            result.error(ILLEGAL_ARGUMENT, Constants.MESSAGE_OR_ADDRESS_CANNOT_BE_NULL, null)
+            replyError(ILLEGAL_ARGUMENT, Constants.MESSAGE_OR_ADDRESS_CANNOT_BE_NULL, null)
             return
           }
 
@@ -117,7 +141,7 @@ class SmsMethodCallHandler(
           val setupHandle = call.argument<Long>(SETUP_HANDLE)
           val backgroundHandle = call.argument<Long>(BACKGROUND_HANDLE)
           if (setupHandle == null || backgroundHandle == null) {
-            result.error(ILLEGAL_ARGUMENT, "Setup handle or background handle missing", null)
+            replyError(ILLEGAL_ARGUMENT, "Setup handle or background handle missing", null)
             return
           }
 
@@ -160,13 +184,13 @@ class SmsMethodCallHandler(
         ActionType.SEND_SMS -> handleSendSmsActions(smsAction)
         ActionType.BACKGROUND -> handleBackgroundActions(smsAction)
         ActionType.GET -> handleGetActions(smsAction)
-        ActionType.PERMISSION -> result.success(true)
+        ActionType.PERMISSION -> replySuccess(true)
         ActionType.CALL -> handleCallActions(smsAction)
       }
     } catch (e: IllegalArgumentException) {
-      result.error(ILLEGAL_ARGUMENT, WRONG_METHOD_TYPE, null)
+      replyError(ILLEGAL_ARGUMENT, WRONG_METHOD_TYPE, null)
     } catch (e: RuntimeException) {
-      result.error(FAILED_FETCH, e.message, null)
+      replyError(FAILED_FETCH, e.message, null)
     }
   }
 
@@ -182,7 +206,7 @@ class SmsMethodCallHandler(
       else -> throw IllegalArgumentException()
     }
     val messages = smsController.getMessages(contentUri, projection!!, selection, selectionArgs, sortOrder)
-    result.success(messages)
+    replySuccess(messages)
   }
 
   private fun handleSendSmsActions(smsAction: SmsAction) {
@@ -199,7 +223,7 @@ class SmsMethodCallHandler(
       SmsAction.SEND_SMS_INTENT -> smsController.sendSmsIntent(address, messageBody)
       else -> throw IllegalArgumentException()
     }
-    result.success(null)
+    replySuccess(null)
   }
 
   private fun handleBackgroundActions(smsAction: SmsAction) {
@@ -240,23 +264,24 @@ class SmsMethodCallHandler(
         SmsAction.GET_SIGNAL_STRENGTH -> {
           if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             getSignalStrength()
-                ?: result.error("SERVICE_STATE_NULL", "Error getting service state", null)
+                ?: replyError("SERVICE_STATE_NULL", "Error getting service state", null)
 
           } else {
-            result.error("INCORRECT_SDK_VERSION", "getServiceState() can only be called on Android Q and above", null)
+            replyError("INCORRECT_SDK_VERSION", "getServiceState() can only be called on Android Q and above", null)
           }
         }
         SmsAction.GET_SERVICE_STATE -> {
           if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             getServiceState()
-                ?: result.error("SERVICE_STATE_NULL", "Error getting service state", null)
+                ?: replyError("SERVICE_STATE_NULL", "Error getting service state", null)
           } else {
-            result.error("INCORRECT_SDK_VERSION", "getServiceState() can only be called on Android O and above", null)
+            replyError("INCORRECT_SDK_VERSION", "getServiceState() can only be called on Android O and above", null)
           }
         }
         else -> throw IllegalArgumentException()
       }
-      result.success(value)
+      // No-op when one of the error branches above already consumed the reply handle.
+      replySuccess(value)
     }
   }
 
@@ -356,10 +381,20 @@ class SmsMethodCallHandler(
 
   override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray): Boolean {
 
+    val deniedPermissions = mutableListOf<String>()
+
+    // Only handle the callback for the request this handler actually made. Other plugins in
+    // the app request permissions with their own request codes, and claiming those callbacks
+    // would reply on an unrelated (already consumed) method channel result.
+    if (!this::action.isInitialized || requestCode != this.requestCode) {
+      return false
+    }
+
     permissionsController.isRequestingPermission = false
 
-    val deniedPermissions = mutableListOf<String>()
-    if (requestCode != this.requestCode && !this::action.isInitialized) {
+    // The platform can deliver the same result more than once (e.g. activity recreation).
+    // Once the reply handle is consumed there is nothing left to answer.
+    if (pendingResult == null) {
       return false
     }
 
@@ -380,7 +415,7 @@ class SmsMethodCallHandler(
   }
 
   private fun onPermissionDenied(deniedPermissions: List<String>) {
-    result.error(PERMISSION_DENIED, PERMISSION_DENIED_MESSAGE, deniedPermissions)
+    replyError(PERMISSION_DENIED, PERMISSION_DENIED_MESSAGE, deniedPermissions)
   }
 
   fun setForegroundChannel(channel: MethodChannel) {
